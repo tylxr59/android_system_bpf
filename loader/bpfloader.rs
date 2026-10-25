@@ -448,10 +448,8 @@ fn set_prog_types(open_file: &mut OpenObject) -> Result<bool, anyhow::Error> {
             prog.section().to_str().ok_or_else(|| anyhow!("Failed to parse prog section name"))?;
         if section_name.starts_with("skfilter/") {
             prog.set_prog_type(ProgramType::SocketFilter);
-        } else if section_name.starts_with("fuse/") {
-            if !set_fuse_prog_type(prog)? {
-                return Ok(false);
-            }
+        } else if section_name.starts_with("fuse/") && !set_fuse_prog_type(prog)? {
+            return Ok(false);
         }
     }
     Ok(true)

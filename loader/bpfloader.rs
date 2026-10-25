@@ -414,34 +414,47 @@ const LOCK_CONTENTION_FILE: BpfFileDesc = BpfFileDesc {
     ..BPF_FILE_DESC_DEFAULT
 };
 
-// TODO: Remove this code when fuse-bpf is upstreamed
-fn set_fuse_prog_type(prog: OpenProgramMut) -> Result<(), anyhow::Error> {
-    let path = Path::new("/sys/fs/fuse/bpf_prog_type_fuse");
-    let prog_type_str =
-        fs::read_to_string(path).map_err(|e| anyhow!("Failed to read fuse prog type: {e}"))?;
-    let prog_type = prog_type_str
+fn parse_fuse_prog_type(contents: std::io::Result<String>) -> Result<Option<u32>, anyhow::Error> {
+    let contents = match contents {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow!("Failed to read fuse prog type: {e}")),
+    };
+    let prog_type = contents
         .trim()
         .parse::<u32>()
-        .map_err(|e| anyhow!("Failed to parse fuse prog type {prog_type_str}: {e}"))?;
+        .map_err(|e| anyhow!("Failed to parse fuse prog type {contents}: {e}"))?;
+    ensure!(prog_type != 0, "Kernel returned unspecified fuse prog type");
+    Ok(Some(prog_type))
+}
+
+// TODO: Remove this code when fuse-bpf is upstreamed
+fn set_fuse_prog_type(prog: OpenProgramMut) -> Result<bool, anyhow::Error> {
+    let path = Path::new("/sys/fs/fuse/bpf_prog_type_fuse");
+    let Some(prog_type) = parse_fuse_prog_type(fs::read_to_string(path))? else {
+        return Ok(false);
+    };
     // SAFETY: If the return value is 0, program type should be updated correctly.
     // prog.set_prog_type can not be used because ProgramType does not contain BPF_PROG_TYPE_FUSE
     if unsafe { bpf_program__set_type(prog.as_libbpf_object().as_ptr(), prog_type) } != 0 {
         return Err(anyhow!("Failed to set fuse prog type {prog_type}"));
     }
-    Ok(())
+    Ok(true)
 }
 
-fn set_prog_types(open_file: &mut OpenObject) -> Result<(), anyhow::Error> {
+fn set_prog_types(open_file: &mut OpenObject) -> Result<bool, anyhow::Error> {
     for mut prog in open_file.progs_mut() {
         let section_name =
             prog.section().to_str().ok_or_else(|| anyhow!("Failed to parse prog section name"))?;
         if section_name.starts_with("skfilter/") {
             prog.set_prog_type(ProgramType::SocketFilter);
         } else if section_name.starts_with("fuse/") {
-            set_fuse_prog_type(prog)?;
+            if !set_fuse_prog_type(prog)? {
+                return Ok(false);
+            }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn create_dir(dir_path: &Path) -> Result<(), anyhow::Error> {
@@ -581,7 +594,10 @@ fn libbpf_worker(file_desc: &BpfFileDesc) -> Result<(), anyhow::Error> {
     let mut open_file = ob.open_file(filepath)?;
     // libbpf's open_file attempts to infer the prog type based on the section name. But, some
     // section names are not recognized, so the program type must be set explicitly for them.
-    set_prog_types(&mut open_file)?;
+    if !set_prog_types(&mut open_file)? {
+        info!("Skipping {}: kernel FUSE-BPF program type is absent", file_desc.filename);
+        return Ok(());
+    }
     set_skip_loading(&mut open_file, file_desc)?;
     let mut loaded_file = open_file.load()?;
 
@@ -776,6 +792,41 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_fuse_type_is_unsupported() {
+        assert_eq!(parse_fuse_prog_type(Err(std::io::ErrorKind::NotFound.into())).unwrap(), None);
+    }
+
+    #[test]
+    fn unreadable_fuse_type_remains_an_error() {
+        assert!(parse_fuse_prog_type(Err(std::io::ErrorKind::PermissionDenied.into())).is_err());
+    }
+
+    #[test]
+    fn valid_fuse_type_is_preserved() {
+        assert_eq!(parse_fuse_prog_type(Ok("31\n".to_owned())).unwrap(), Some(31));
+    }
+
+    #[test]
+    fn malformed_fuse_type_is_rejected() {
+        assert!(parse_fuse_prog_type(Ok("invalid".to_owned())).is_err());
+    }
+
+    #[test]
+    fn empty_fuse_type_is_rejected() {
+        assert!(parse_fuse_prog_type(Ok(String::new())).is_err());
+    }
+
+    #[test]
+    fn unspecified_fuse_type_is_rejected() {
+        assert!(parse_fuse_prog_type(Ok("0".to_owned())).is_err());
+    }
+
+    #[test]
+    fn overflowing_fuse_type_is_rejected() {
+        assert!(parse_fuse_prog_type(Ok("4294967296".to_owned())).is_err());
+    }
 
     #[test]
     fn verify_parse_release() {
